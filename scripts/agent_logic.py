@@ -1,43 +1,44 @@
-# Create this as a new utility: scripts/agent_logic.py
-
 import requests
-from googlesearch import search # pip install googlesearch-python
+import os
+from googlesearch import search
 
-def get_market_news(ticker):
-    """Fetches the last 3 news headlines for the ticker."""
-    query = f"{ticker} stock news NSE India"
-    results = []
+def get_live_context(ticker):
+    """Fetches the latest 3 headlines for the stock to bypass knowledge cutoff."""
+    query = f"{ticker} stock news NSE India today"
+    headlines = []
     try:
-        # 2026 Search: Grabbing top 3 live headlines
-        for j in search(query, num=3, stop=3, pause=2):
-            results.append(j)
-        return "\n".join(results)
+        # Grabbing real-time results from the web
+        for url in search(query, num_results=3):
+            headlines.append(url)
+        return "\n".join(headlines)
     except:
-        return "No recent news found."
+        return "No live news found. Relying on technical data only."
 
-def analyze_with_context(ticker, ltp, rsi):
-    """The 'Oracle' reasoning engine."""
-    # 1. Get Live News
-    news = get_market_news(ticker)
+def analyze_with_gemma4(ticker, ltp, rsi):
+    """The Oracle's Reasoning Engine using Gemma 4:e4b."""
+    news_context = get_live_context(ticker)
     
-    # 2. Build the 'Briefing Document'
-    context = f"""
-    INSTRUMENT: {ticker}
-    LIVE PRICE: ₹{ltp}
-    RSI (14): {rsi}
-    RECENT NEWS/LINKS: 
-    {news}
+    # We provide the 'Internet Data' in the prompt
+    prompt = f"""
+    [SYSTEM: FINANCIAL ANALYST MODE]
+    You are an expert SEBI-certified analyst. 
     
-    TASK: Act as a SEBI-registered technical analyst. 
-    Analyze the momentum based on the RSI and the current price. 
-    Cross-reference with any news sentiment if available.
-    Give a 2-sentence verdict: BULLISH, BEARISH, or NEUTRAL.
+    CURRENT MARKET DATA:
+    - Stock: {ticker}
+    - Current Price (LTP): ₹{ltp}
+    - RSI: {rsi}
+    - Recent News/Links: {news_context}
+    
+    TASK: Analyze if this is a safe Momentum entry. 
+    Check if the stock is overextended (RSI > 75) or if news is negative.
+    Verdicts: BULLISH, BEARISH, or NEUTRAL. Max 2 sentences.
     """
     
-    # 3. Send to Gemma 3
     try:
+        # CRITICAL: Pointing to your local Gemma 4 model
         r = requests.post("http://localhost:11434/api/generate", 
-                          json={"model": "gemma3:4b", "prompt": context, "stream": False})
-        return r.json().get("response", "Analysis Failed.")
-    except:
-        return "AI Brain Offline."
+                          json={"model": "gemma4:e4b", "prompt": prompt, "stream": False}, 
+                          timeout=120)
+        return r.json().get("response", "AI Reasoning Failed.")
+    except Exception as e:
+        return f"🤖 Gemma 4 Connection Error: {str(e)}"
