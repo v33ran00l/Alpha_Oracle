@@ -16,19 +16,24 @@ class BrokerState:
     current_selection_ltp = 0
 state = BrokerState()
 
-# --- 1. DYNAMIC MARKET PULSE (Hardened VIX Fix) ---
+# --- 1. DYNAMIC STRATEGY DISCOVERY ---
+def get_all_scanners():
+    """Scans the scripts folder for any file ending in _scanner.py"""
+    try:
+        files = os.listdir("scripts")
+        # Filter for .py files that contain 'scanner'
+        scanners = [f.replace(".py", "") for f in files if f.endswith("_scanner.py")]
+        return scanners if scanners else ["india_scanner"]
+    except:
+        return ["india_scanner"]
+
+# --- 2. MARKET & BROKER LOGIC ---
 def fetch_live_market_data():
     try:
-        # Fetch 1 month to ensure we have valid history to fill gaps
-        data = yf.download(tickers="^NSEI ^BSESN INDIAVIX.NS", period="1mo", interval="1d", progress=False)
-        
-        # Multi-stage cleaning: Forward fill then pick the last row that isn't all NaN
+        data = yf.download(tickers="^NSEI ^BSESN INDIAVIX.NS", period="5d", interval="1d", progress=False)
         cleaned_df = data['Close'].ffill().dropna()
-        if cleaned_df.empty: return "17.20", "24,350", "80,305"
+        last, prev = cleaned_df.iloc[-1], cleaned_df.iloc[-2]
         
-        last = cleaned_df.iloc[-1]
-        prev = cleaned_df.iloc[-2]
-
         def format_val(val, p_val, is_vix=False):
             diff = val - p_val
             color = "🟢" if (diff >= 0 if not is_vix else diff <= 0) else "🔴"
@@ -37,46 +42,8 @@ def fetch_live_market_data():
         return (format_val(last['INDIAVIX.NS'], prev['INDIAVIX.NS'], True), 
                 format_val(last['^NSEI'], prev['^NSEI']), 
                 format_val(last['^BSESN'], prev['^BSESN']))
-    except:
-        return "17.20 (Stable)", "24,350", "80,305"
+    except: return "17.20", "24,350", "80,305"
 
-# --- 2. JOURNAL & ORDER LOGIC ---
-def log_trade_local(ticker, qty, exec_price, stop_loss, reason, order_id):
-    log_dir = os.path.join(os.getcwd(), "data")
-    log_file = os.path.join(log_dir, "trade_journal.csv")
-    os.makedirs(log_dir, exist_ok=True)
-    
-    new_entry = {
-        "Date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "Stock": ticker,
-        "Qty": int(qty),
-        "Selection_Price": state.current_selection_ltp,
-        "Execution_Price": float(exec_price),
-        "Stop_Loss": float(stop_loss),
-        "Reason": str(reason),
-        "Order_ID": str(order_id)
-    }
-    pd.DataFrame([new_entry]).to_csv(log_file, mode='a', index=False, header=not os.path.exists(log_file))
-
-def fetch_combined_logs():
-    """Fetches BOTH local journal and live broker orders."""
-    # A. Local Journal
-    log_file = os.path.join(os.getcwd(), "data", "trade_journal.csv")
-    journal_df = pd.read_csv(log_file).iloc[::-1] if os.path.exists(log_file) else pd.DataFrame([{"Status": "No Journal Entries"}])
-    
-    # B. Broker Orders
-    order_df = pd.DataFrame([{"Status": "Broker Offline"}])
-    if state.api:
-        try:
-            ob = state.api.orderBook()
-            if ob['status'] and ob['data']:
-                order_df = pd.DataFrame(ob['data'])[['tradingsymbol', 'orderstatus', 'quantity', 'price', 'text', 'orderid']]
-                order_df = order_df.iloc[::-1] # Newest first
-        except: order_df = pd.DataFrame([{"Status": "API Error fetching orders"}])
-    
-    return journal_df, order_df
-
-# --- 3. BROKER CORE ---
 def broker_login():
     try:
         totp = pyotp.TOTP(os.getenv("ANGEL_TOTP_SECRET")).now()
@@ -88,51 +55,9 @@ def broker_login():
             vix, nifty, sensex = fetch_live_market_data()
             return "🟢 ONLINE", vix, nifty, sensex, state.cash
         return "🔴 FAILED", "N/A", "N/A", "N/A", "₹0"
-    except Exception as e: return f"⚠️ ERROR: {str(e)[:20]}", "N/A", "N/A", "N/A", "₹0"
+    except Exception as e: return "⚠️ ERROR", "N/A", "N/A", "N/A", "₹0"
 
-def fetch_portfolio_clean():
-    if not state.api: return pd.DataFrame([{"Message": "Connect First"}])
-    try:
-        h_resp = state.api.holding()
-        if h_resp.get('status') and h_resp.get('data'):
-            df = pd.DataFrame(h_resp['data'])
-            # Ensure numbers are treated as numbers
-            df['ltp'] = pd.to_numeric(df['ltp'], errors='coerce')
-            df['averageprice'] = pd.to_numeric(df['averageprice'], errors='coerce')
-            df['quantity'] = pd.to_numeric(df['quantity'], errors='coerce')
-            
-            df['P&L'] = ((df['ltp'] - df['averageprice']) * df['quantity']).fillna(0).round(0).astype(int)
-            df['Status'] = df['P&L'].apply(lambda x: "🟢 PROFIT" if x >= 0 else "🔴 LOSS")
-            return df[['tradingsymbol', 'quantity', 'averageprice', 'ltp', 'P&L', 'Status']]
-        return pd.DataFrame([{"Status": "No holdings."}])
-    except: return pd.DataFrame([{"Error": "API Fail"}])
-
-def place_order_hardened(ticker, qty, price, stop_loss, reason):
-    if not state.api: return "❌ System Offline"
-    if not reason or len(reason) < 3: return "⚠️ Please provide a reason."
-    try:
-        df = pd.read_csv("data/nse_tokens.csv")
-        token = str(df[df['clean_symbol'] == ticker.upper()].iloc[0]['token'])
-        params = {
-            "variety": "NORMAL", "tradingsymbol": f"{ticker}-EQ",
-            "symboltoken": token, "transactiontype": "BUY", "exchange": "NSE",
-            "ordertype": "LIMIT", "producttype": "DELIVERY", "duration": "DAY",
-            "price": str(round(float(price), 2)), "quantity": str(int(qty)), "scripconsent": "YES" 
-        }
-        res = state.api.placeOrder(params)
-        
-        # IDENTIFY SUCCESS (Handle raw string or dict)
-        oid = "FAILED"
-        if isinstance(res, str) and len(res) > 5: oid = res
-        elif isinstance(res, dict) and res.get('status'): oid = res['data']['script']
-        
-        if oid != "FAILED":
-            log_trade_local(ticker, qty, price, stop_loss, reason, oid)
-            return f"🚀 SUCCESS! Order {oid} logged."
-        return f"❌ REJECTED: {res.get('message', 'Unknown Error')}"
-    except Exception as e: return f"❌ Error: {str(e)}"
-
-# --- 4. UI CONSTRUCTION ---
+# --- 3. UI THEME ---
 custom_css = """
 .gradio-container { background-color: #0b111b; color: #e2e8f0; }
 h1 { text-align: center; color: #00d4ff; font-weight: 800; font-size: 20px; margin: 0; padding: 10px; }
@@ -143,6 +68,7 @@ h1 { text-align: center; color: #00d4ff; font-weight: 800; font-size: 20px; marg
 with gr.Blocks(title="Alpha-Oracle", css=custom_css, theme=gr.themes.Soft()) as demo:
     gr.HTML("<h1>🏛️ ALPHA-ORACLE COMMAND CENTER</h1>")
     
+    # --- DYNAMIC HEADER ---
     with gr.Row(elem_classes="header-row"):
         with gr.Column(scale=1, min_width=150):
             login_btn = gr.Button("🔗 INITIALIZE", variant="primary", size="sm")
@@ -159,9 +85,11 @@ with gr.Blocks(title="Alpha-Oracle", css=custom_css, theme=gr.themes.Soft()) as 
     with gr.Tabs():
         with gr.Tab("🛰️ SCANNER"):
             with gr.Row():
-                strategy = gr.Dropdown(choices=["india_scanner"], value="india_scanner", label="Universe", scale=2)
-                run_btn = gr.Button("🔍 SCAN NIFTY 500", variant="secondary", scale=1)
-            scanner_results = gr.Dataframe(label="Targets", interactive=False)
+                # FIX: Dropdown now uses get_all_scanners() to find all your scripts
+                strategy = gr.Dropdown(choices=get_all_scanners(), 
+                                       label="Universe / Strategy", scale=2)
+                run_btn = gr.Button("🔍 RUN STRATEGY SCAN", variant="secondary", scale=1)
+            scanner_results = gr.Dataframe(label="Detected Opportunities", interactive=False)
             with gr.Row():
                 with gr.Column():
                     sel_ticker = gr.Textbox(label="Ticker Focus", interactive=False)
@@ -187,15 +115,28 @@ with gr.Blocks(title="Alpha-Oracle", css=custom_css, theme=gr.themes.Soft()) as 
 
         with gr.Tab("📋 JOURNAL & ORDERS"):
             refresh_j_btn = gr.Button("🔄 REFRESH ALL LOGS", variant="secondary")
-            gr.Markdown("### 📒 Local Trade Journal (Reasoning)")
-            journal_table = gr.Dataframe()
-            gr.Markdown("---")
-            gr.Markdown("### 📡 Live Broker Order Book (Execution Status)")
-            order_table = gr.Dataframe()
+            journal_table = gr.Dataframe(label="Local Journal")
+            order_table = gr.Dataframe(label="Broker Order Book")
 
-    # --- LOGIC ---
+    # --- LOGIC INTEGRATION ---
     login_btn.click(fn=broker_login, outputs=[status_box, vix_box, nifty_box, sensex_box, cash_box])
-    run_btn.click(fn=lambda s: importlib.import_module(f"scripts.{s}").run_logic(), inputs=strategy, outputs=scanner_results)
+    
+    # This dynamically imports whichever scanner you pick from the dropdown
+    def run_dynamic_scan(strategy_name):
+        if not state.api:
+            return pd.DataFrame([{"Error": "Initialize Handshake First!"}])
+
+        spec = importlib.util.spec_from_file_location(strategy_name, f"scripts/{strategy_name}.py")
+        if spec is None or spec.loader is None:
+            return pd.DataFrame([{"Error": "Strategy module not found"}])
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        # PASS the api to the scanner so it can fetch official data
+        return module.run_logic(state.api)
+
+    run_btn.click(fn=run_dynamic_scan, inputs=strategy, outputs=scanner_results)
     
     def on_select(evt: gr.SelectData):
         ticker = evt.value
@@ -210,9 +151,21 @@ with gr.Blocks(title="Alpha-Oracle", css=custom_css, theme=gr.themes.Soft()) as 
 
     scanner_results.select(fn=on_select, outputs=[sel_ticker, live_ltp, ai_memo, exec_ticker, exec_limit, exec_sl])
     ai_ask_btn.click(fn=oracle_brain.analyze_with_gemma4, inputs=[sel_ticker, live_ltp, gr.State(65)], outputs=ai_memo)
-    refresh_p_btn.click(fn=fetch_portfolio_clean, outputs=portfolio_table)
-    refresh_j_btn.click(fn=fetch_combined_logs, outputs=[journal_table, order_table])
-    confirm_btn.click(fn=place_order_hardened, inputs=[exec_ticker, exec_qty, exec_limit, exec_sl, exec_reason], outputs=exec_log)
+    
+    # Direct function imports for Vault and Orders
+    import app as main_logic # Ensure current logic is available
+    refresh_p_btn.click(fn=lambda: main_logic.fetch_portfolio_clean(), outputs=portfolio_table)
+    
+    def refresh_logs_combined():
+        j = main_logic.fetch_journal_log()
+        o = main_logic.fetch_combined_logs()[1] # Fetch just the order book
+        return j, o
+
+    refresh_j_btn.click(fn=refresh_logs_combined, outputs=[journal_table, order_table])
+    
+    confirm_btn.click(fn=lambda t,q,p,s,r: main_logic.place_order_hardened(t,q,p,s,r), 
+                     inputs=[exec_ticker, exec_qty, exec_limit, exec_sl, exec_reason], 
+                     outputs=exec_log)
 
 if __name__ == "__main__":
     demo.launch(server_port=7861)
