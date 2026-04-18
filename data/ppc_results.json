@@ -1,0 +1,14 @@
+[
+    {
+        "Ticker":"NOK",
+        "Price":10.39,
+        "RSI":79.1,
+        "Vol_Ratio":1.16
+    },
+    {
+        "Ticker":"TS",
+        "Price":60.36,
+        "RSI":74.6,
+        "Vol_Ratio":1.12
+    }
+]
