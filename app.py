@@ -1,18 +1,17 @@
 import gradio as gr
 import pandas as pd
 import sys, os, webbrowser, importlib.util, requests, pyotp
-from datetime import datetime
 from dotenv import load_dotenv
 from SmartApi import SmartConnect
-from openbb import obb
+# Import your new Internet-Aware Agent
+import scripts.agent_logic as oracle_brain 
 
 load_dotenv()
 
-# --- GLOBAL BROKER STATE ---
+# --- GLOBAL STATE ---
 class BrokerState:
     api = None
-    cash_balance = "Click Login"
-
+    cash = "Connect First"
 state = BrokerState()
 
 # --- BROKER LOGIC ---
@@ -23,97 +22,105 @@ def broker_login():
         session = state.api.generateSession(os.getenv("ANGEL_CLIENT_ID"), os.getenv("ANGEL_PASSWORD"), totp)
         if session['status']:
             funds = state.api.rmsLimit()
-            state.cash_balance = f"₹{funds['data']['net']}"
-            return f"✅ ONLINE | Balance: {state.cash_balance}"
-        return "❌ Login Failed"
-    except Exception as e:
-        return f"⚠️ Error: {str(e)}"
+            state.cash = f"₹{funds['data']['net']}"
+            return f"🟢 ONLINE | Balance: {state.cash}"
+        return "🔴 Login Failed"
+    except Exception as e: return f"⚠️ Error: {str(e)}"
 
-def place_broker_order(ticker, qty, price):
-    """Phase 5b: Final Execution Logic (SEBI 2026 Compliant)"""
-    if not state.api: return "❌ Error: Not Logged In"
+def place_order_final(ticker, qty, price):
+    """FIXED: Now properly retrieves state for execution"""
+    if not state.api: return "❌ System Offline: Connect Angel One"
+    if not ticker or price <= 0: return "❌ Invalid Order Data"
+    
     try:
-        token_df = pd.read_csv("data/nse_tokens.csv")
-        match = token_df[token_df['clean_symbol'] == ticker.upper()]
-        token = str(match.iloc[0]['token'])
-
-        # Order Parameters
-        order_params = {
-            "variety": "NORMAL",
-            "tradingsymbol": f"{ticker}-EQ",
-            "symboltoken": token,
-            "transactiontype": "BUY",
-            "exchange": "NSE",
-            "ordertype": "LIMIT",
-            "producttype": "DELIVERY", # Safer for novices (no auto-squareoff)
-            "duration": "DAY",
-            "price": str(price),
-            "quantity": str(int(qty))
-        }
+        # 1. Get Token from local dict
+        df = pd.read_csv("data/nse_tokens.csv")
+        token = str(df[df['clean_symbol'] == ticker.upper()].iloc[0]['token'])
         
-        order_id = state.api.placeOrder(order_params)
-        return f"🚀 ORDER PLACED! ID: {order_id}"
-    except Exception as e:
-        return f"❌ Execution Error: {str(e)}"
+        # 2. SEBI 2026 Limit Order Packet
+        params = {
+            "variety": "NORMAL", "tradingsymbol": f"{ticker}-EQ",
+            "symboltoken": token, "transactiontype": "BUY",
+            "exchange": "NSE", "ordertype": "LIMIT",
+            "producttype": "DELIVERY", "duration": "DAY",
+            "price": str(price), "quantity": str(int(qty))
+        }
+        order_id = state.api.placeOrder(params)
+        return f"🚀 SUCCESS! Order ID: {order_id}"
+    except Exception as e: return f"❌ Failed: {str(e)}"
 
-# --- UI COMMAND CENTER ---
-with gr.Blocks(title="Alpha-Oracle Command Center", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🏛️ Alpha-Oracle Command Center (Final MVP)")
+# --- UI ARCHITECTURE ---
+with gr.Blocks(title="Alpha-Oracle 2026", theme=gr.themes.Soft()) as demo:
+    gr.HTML("<h1 style='text-align: center; color: #00d4ff;'>🏛️ ALPHA-ORACLE: INTERNET-AWARE</h1>")
     
+    # 1. Header (Static)
     with gr.Row():
-        login_btn = gr.Button("🔗 CONNECT ANGEL ONE", variant="primary")
-        balance_display = gr.Textbox(label="Status", value=state.cash_balance, interactive=False)
+        login_btn = gr.Button("🔗 INITIALIZE HANDSHAKE", variant="primary")
+        status_box = gr.Textbox(label="System Status", value="🔴 DISCONNECTED", interactive=False)
+        gr.Textbox(label="Regime", value="🟢 T+0 SETTLEMENT ACTIVE", interactive=False)
 
-    with gr.Tabs():
-        with gr.Tab("🚀 Active Scanner"):
-            with gr.Row():
-                strategy_select = gr.Dropdown(choices=["india_scanner"], value="india_scanner", label="Strategy")
-                run_btn = gr.Button("RUN GLOBAL SCAN")
+    with gr.Tabs() as tabs:
+        # TAB 1: SCANNER
+        with gr.Tab("🛰️ SCANNER"):
+            scan_btn = gr.Button("🔍 SCAN NIFTY 500 (LIVE BATCH)")
+            scanner_results = gr.Dataframe(label="Momentum Signals", interactive=False)
             
-            results_table = gr.Dataframe(label="Signals", interactive=False)
-
             with gr.Row():
-                with gr.Column(scale=1):
-                    gr.Markdown("### 📊 Execution Panel")
-                    sel_ticker = gr.Textbox(label="Ticker", interactive=False)
-                    live_ltp = gr.Textbox(label="Live LTP", interactive=False)
-                    order_qty = gr.Number(label="Qty", value=1)
-                    limit_price = gr.Number(label="Limit Price")
-                    execute_btn = gr.Button("🔥 CONFIRM & EXECUTE TRADE", variant="stop")
-                    order_status = gr.Markdown("Ready for orders...")
-                
-                with gr.Column(scale=1):
-                    gr.Markdown("### 🤖 AI Analyst (Gemma 3)")
-                    ai_memo = gr.Textbox(label="Risk Assessment", lines=8, interactive=False)
+                with gr.Column():
+                    sel_ticker = gr.Textbox(label="Active Focus", interactive=False)
+                    live_ltp = gr.Textbox(label="Live Price (LTP)", interactive=False)
+                with gr.Column():
+                    # COMPUTE CONTROL: AI only runs on demand
+                    ai_ask_btn = gr.Button("🤖 ASK ORACLE (Search + Analysis)", variant="primary")
+                    ai_memo = gr.Textbox(label="Agentic Reasoning", lines=6, interactive=False)
 
-    # --- LOGIC FLOWS ---
-    login_btn.click(fn=broker_login, outputs=balance_display)
-    run_btn.click(fn=lambda s: importlib.import_module(f"scripts.{s}").run_logic(), 
-                  inputs=strategy_select, outputs=results_table)
+        # TAB 2: EXECUTION
+        with gr.Tab("🔥 EXECUTION"):
+            with gr.Row():
+                exec_ticker = gr.Textbox(label="Ticker", interactive=False)
+                exec_qty = gr.Number(label="Qty", value=1)
+                exec_limit = gr.Number(label="Limit Price (SEBI 2026)")
+            buy_confirm_btn = gr.Button("⚡ CONFIRM & SEND TO EXCHANGE", variant="stop")
+            order_status = gr.Markdown("### Status: Waiting...")
+
+        # TAB 3: PORTFOLIO
+        with gr.Tab("💼 VAULT"):
+            refresh_btn = gr.Button("🔄 FETCH LIVE P&L")
+            portfolio_df = gr.Dataframe(label="Current Holdings")
+
+    # --- DATA PIPELINE LOGIC ---
+    login_btn.click(fn=broker_login, outputs=status_box)
     
+    # Selecting a stock in the scanner tab now fills EVERYTHING
     def on_select(evt: gr.SelectData):
         ticker = evt.value
+        # 1. Open TradingView
         webbrowser.open(f"https://www.tradingview.com/chart/?symbol=NSE:{ticker}")
+        # 2. Get Live LTP
+        try:
+            df = pd.read_csv("data/nse_tokens.csv")
+            token = str(df[df['clean_symbol'] == ticker.upper()].iloc[0]['token'])
+            quote = state.api.ltpData("NSE", f"{ticker}-EQ", token)
+            ltp = quote['data']['ltp']
+        except: ltp = 0
         
-        # 1. Get Live Price
-        token_df = pd.read_csv("data/nse_tokens.csv")
-        token = str(token_df[token_df['clean_symbol'] == ticker.upper()].iloc[0]['token'])
-        quote = state.api.ltpData("NSE", f"{ticker}-EQ", token)
-        ltp = quote['data']['ltp'] if quote['status'] else 0
-        
-        # 2. Get AI Synthesis
-        prompt = f"Risk check for {ticker} at ₹{ltp}. 2 sentences max."
-        r = requests.post("http://localhost:11434/api/generate", 
-                          json={"model": "gemma3:4b", "prompt": prompt, "stream": False}, timeout=100)
-        memo = r.json().get("response", "AI Offline")
-        
-        return ticker, ltp, memo, round(float(ltp) + 0.05, 2)
+        # 3. Auto-calc Limit
+        limit = round(float(ltp) + 0.05, 2)
+        return ticker, ltp, "", ticker, limit # Clear AI memo on new select
 
-    results_table.select(fn=on_select, outputs=[sel_ticker, live_ltp, ai_memo, limit_price])
-    
-    execute_btn.click(fn=place_broker_order, 
-                      inputs=[sel_ticker, order_qty, limit_price], 
-                      outputs=order_status)
+    scanner_results.select(fn=on_select, outputs=[sel_ticker, live_ltp, ai_memo, exec_ticker, exec_limit])
 
-if __name__ == "__main__":
-    demo.launch(server_port=7861)
+    # AI AGENTIC TRIGGER (Now with Internet Search)
+    def run_agent(ticker, ltp):
+        if not ticker: return "Select a stock first."
+        # Call your new logic: Internet Search -> Gemma 3 Reasoning
+        return oracle_brain.analyze_with_context(ticker, ltp, "N/A")
+
+    ai_ask_btn.click(fn=run_agent, inputs=[sel_ticker, live_ltp], outputs=ai_memo)
+
+    # FINAL EXECUTION TRIGGER
+    buy_confirm_btn.click(fn=place_order_final, 
+                          inputs=[exec_ticker, exec_qty, exec_limit], 
+                          outputs=order_status)
+
+demo.launch(server_port=7861)
